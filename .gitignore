@@ -1,0 +1,5 @@
+HUGGINGFACE_TOKEN
+
+**/__pycache__/
+.vscode/
+**/exp*/
