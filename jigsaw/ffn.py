@@ -1,0 +1,308 @@
+import numpy as np
+
+import torch
+import torch.nn as nn
+
+# Adapted from Diffusion Illusions (Burgert et al. 2024)
+# https://github.com/RyannDaGreat/Diffusion-Illusions/blob/71646f3203e31f126cf2d7998d2507ee326b7c54/source/learnable_textures.py
+
+def get_uv_grid(height, width, batch_size=1, mind=0, maxd=1):
+    y_c = np.linspace(mind, maxd, height, endpoint=False)
+    x_c = np.linspace(mind, maxd, width, endpoint=False)
+
+    uv = np.stack(np.meshgrid(y_c, x_c), axis=-1)
+    uv_grid = torch.from_numpy(uv).unsqueeze(0).permute(0, 3, 1, 2).float().contiguous()
+    uv_grid = uv_grid.repeat(batch_size, 1, 1, 1)
+    return uv_grid
+
+class GaussianFourierFeatureTransform(nn.Module):
+    def __init__(self, channels, num_features=256, scale=10):
+        super().__init__()
+        self.channels = channels
+        self.num_features = num_features
+
+        self.freqs = nn.Parameter(torch.randn(channels, num_features) * scale, requires_grad=False)
+
+    def forward(self, x):
+        B, C, H, W = x.shape
+        x = x.permute(0, 2, 3, 1).reshape(B * H * W, C)
+        x = x @ self.freqs
+        x = x.view(B, H, W, self.num_features)
+        x = x.permute(0, 3, 1, 2)
+        x = 2 * torch.pi * x
+        output = torch.cat([torch.sin(x), torch.cos(x)], dim=1)
+        return output
+
+class LearnableImage(nn.Module):
+    def __init__(self, height, width, channels):
+        super().__init__()
+        self.height = height
+        self.width = width
+        self.channels = channels
+    
+    def to_image(self):
+        # calls the forward method
+        image = self()
+        # returns [N, H, W, C]
+        return image.detach().cpu().numpy()
+
+    def to_tex(self):
+        tex = self() # [N, H, W, C]
+        if tex.shape[3] == 1:
+            tex = tex.repeat(1, 1, 1, 3)
+        return tex
+    
+    
+    def forward(self):
+        raise NotImplementedError("Subclasses should implement this method")
+
+class LearnableImageFourier(LearnableImage):
+    def __init__(self, height, width, channels=3, hidden_dim=256, num_features=128, scale=10, sigmoid_last=True):
+        super().__init__(height, width, channels)
+        self.uv_grid = nn.Parameter(get_uv_grid(height, width, batch_size=1), requires_grad=False)
+        self.feature_extractor = GaussianFourierFeatureTransform(2, num_features, scale)
+        self.features = nn.Parameter(self.feature_extractor(self.uv_grid), requires_grad=False)
+
+        H = hidden_dim
+        C = channels
+        M = 2 * num_features
+        layers = [
+            nn.Conv2d(M, H, kernel_size=1), nn.ReLU(), nn.BatchNorm2d(H),
+            nn.Conv2d(H, H, kernel_size=1), nn.ReLU(), nn.BatchNorm2d(H),
+            nn.Conv2d(H, H, kernel_size=1), nn.ReLU(), nn.BatchNorm2d(H),
+            nn.Conv2d(H, C, kernel_size=1),
+        ]
+        if sigmoid_last:
+            layers.append(nn.Sigmoid())
+        
+        self.model = nn.Sequential(*layers)
+
+    def forward(self):
+        output = self.model(self.features).permute(0, 2, 3, 1)
+        # returns [N, H, W, C]
+        return output
+    
+class MultiLearnableImageFourier(LearnableImage):
+    def __init__(self, height, width, channels=3, num=1, hidden_dim=256, num_features=128, scale=10, latent_dim=64):
+        super().__init__(height, width, channels)
+        self.num = num
+
+        self.uv_grid = nn.Parameter(get_uv_grid(height, width, batch_size=1), requires_grad=False)
+        self.feature_extractor = GaussianFourierFeatureTransform(2, num_features, scale)
+        self.features = nn.Parameter(self.feature_extractor(self.uv_grid), requires_grad=False)
+
+        # per-image latent vectors
+        self.latents = nn.Parameter(torch.randn(num, latent_dim), requires_grad=True)
+
+        H = hidden_dim
+        C = channels
+        M = 2 * num_features + latent_dim
+        self.model = nn.Sequential(
+            nn.Conv2d(M, H, kernel_size=1), nn.ReLU(), nn.BatchNorm2d(H),
+            nn.Conv2d(H, H, kernel_size=1), nn.ReLU(), nn.BatchNorm2d(H),
+            nn.Conv2d(H, H, kernel_size=1), nn.ReLU(), nn.BatchNorm2d(H),
+            nn.Conv2d(H, C, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self):
+        B = self.num
+        H, W = self.features.shape[-2:]
+        features = self.features.expand(B, -1, -1, -1)
+        latents = self.latents[:, :, None, None].expand(-1, -1, H, W)
+        x = torch.cat([features, latents], dim=1)
+        output = self.model(x).permute(0, 2, 3, 1)
+        # returns [N, H, W, C]
+        return output
+
+# from https://github.com/vsitzmann/siren
+class SineLayer(nn.Module):
+    # See paper sec. 3.2, final paragraph, and supplement Sec. 1.5 for discussion of omega_0.
+    
+    # If is_first=True, omega_0 is a frequency factor which simply multiplies the activations before the 
+    # nonlinearity. Different signals may require different omega_0 in the first layer - this is a 
+    # hyperparameter.
+    
+    # If is_first=False, then the weights will be divided by omega_0 so as to keep the magnitude of 
+    # activations constant, but boost gradients to the weight matrix (see supplement Sec. 1.5)
+    
+    def __init__(self, in_features, out_features, bias=True, is_first=False, omega_0=30):
+        super().__init__()
+        self.omega_0 = omega_0
+        self.is_first = is_first
+        self.layer = nn.Conv2d(in_features, out_features, kernel_size=1, bias=bias)         
+        self.init_weights()
+    
+    def init_weights(self):
+        with torch.no_grad():
+            if self.is_first:
+                self.layer.weight.uniform_(-1 / self.layer.in_channels, 1 / self.layer.in_channels)      
+            else:
+                self.layer.weight.uniform_(-np.sqrt(6 / self.layer.in_channels) / self.omega_0, np.sqrt(6 / self.layer.in_channels) / self.omega_0)
+
+            if self.layer.bias is not None:
+                    self.layer.bias.fill_(0.)
+
+    def forward(self, input):
+        return torch.sin(self.omega_0 * self.layer(input))
+
+
+class Siren(nn.Module):
+    def __init__(self, in_features, hidden_features, hidden_layers, out_features, outermost_linear=False, 
+                 first_omega_0=30, hidden_omega_0=30.):
+        super().__init__()
+        
+        self.net = []
+        self.net.append(nn.Conv2d(in_features, hidden_features, kernel_size=1))
+        self.net.append(SineLayer(hidden_features, hidden_features, is_first=True, omega_0=first_omega_0))
+
+        for _ in range(hidden_layers):
+            self.net.append(SineLayer(hidden_features, hidden_features, is_first=False, omega_0=hidden_omega_0))
+
+        if outermost_linear:
+            final_linear = nn.Conv2d(hidden_features, out_features, kernel_size=1)
+            with torch.no_grad():
+                final_linear.weight.uniform_(-np.sqrt(6 / hidden_features) / hidden_omega_0, np.sqrt(6 / hidden_features) / hidden_omega_0)
+            self.net.append(final_linear)
+        else:
+            self.net.append(SineLayer(hidden_features, out_features, is_first=False, omega_0=hidden_omega_0))
+        
+        self.net = nn.Sequential(*self.net)
+    
+    def forward(self, x):
+        output = self.net(x)
+        return output
+
+class LearnableImageSiren(LearnableImage):
+    def __init__(self, height, width, channels=3, hidden_dim=256, hidden_layers=3, first_omega_0=10, hidden_omega_0=30):
+        super().__init__(height, width, channels)
+        self.uv_grid = nn.Parameter(get_uv_grid(height, width, batch_size=1, mind=-1, maxd=1), requires_grad=False)
+        self.model = Siren(in_features=2, hidden_features=hidden_dim, hidden_layers=hidden_layers, out_features=channels, outermost_linear=True, first_omega_0=first_omega_0, hidden_omega_0=hidden_omega_0)
+
+    def forward(self):
+        output = self.model(self.uv_grid).permute(0, 2, 3, 1)
+        # returns [N, H, W, C]
+        return output
+
+class LearnableImageFourierSiren(LearnableImageFourier):
+    def __init__(self, height, width, channels=3, hidden_dim=256, num_features=128, scale=7, hidden_layers=2, first_omega_0=10, hidden_omega_0=30):
+        super().__init__(height, width, channels, hidden_dim, num_features, scale)
+        self.model = Siren(in_features = 2 * num_features, out_features=channels, hidden_features=hidden_dim, hidden_layers=hidden_layers, outermost_linear=True, first_omega_0=first_omega_0, hidden_omega_0=hidden_omega_0)
+
+
+# Multiresolution Hash Encoding implementation
+class HashEncoding(nn.Module):
+    def __init__(self, num_levels=16, table_size=2**14, features_per_level=2, 
+                 min_res=16, max_res=512, log2_table_size=14):
+        super().__init__()
+        self.num_levels = num_levels
+        self.table_size = table_size
+        self.features_per_level = features_per_level
+        self.log2_table_size = log2_table_size
+        
+        # Growth factor for resolution
+        self.b = np.exp((np.log(max_res) - np.log(min_res)) / (num_levels - 1))
+        self.min_res = min_res
+        
+        # Feature tables for each level
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(table_size, features_per_level) for _ in range(num_levels)
+        ])
+        
+        # Initialize embeddings with small random values
+        for emb in self.embeddings:
+            nn.init.uniform_(emb.weight, -1e-4, 1e-4)
+
+    def hash(self, coords):
+        # coords: [..., 2] (integers)
+        # Spatial hash function from Instant-NGP
+        # (x * 1) ^ (y * 2,654,435,761)
+        # Using 1D/2D version here.
+        x, y = coords[..., 0], coords[..., 1]
+        
+        # Large primes for hashing
+        # In 2D: (x * 1) ^ (y * 2654435761)
+        h = (x * 1) ^ (y * 2654435761)
+        return h % self.table_size
+
+    def forward(self, x):
+        # x: [B, C, H, W] where C=2 (UV coordinates in [0, 1])
+        B, C, H, W = x.shape
+        x = x.permute(0, 2, 3, 1) # [B, H, W, 2]
+        
+        level_features = []
+        
+        for i in range(self.num_levels):
+            res = int(np.ceil(self.min_res * (self.b ** i)))
+            
+            # Scale coordinates to grid resolution
+            scaled_x = x * res
+            
+            # Corners
+            x0 = torch.floor(scaled_x).long()
+            x1 = x0 + 1
+            
+            # Relative position within cell
+            wt = scaled_x - x0.float() # [B, H, W, 2]
+            
+            # Corner coordinates (clamped to prevent overflow before hash)
+            # Actually, the hash handles large ints, but we should be careful.
+            # Local grid corners
+            c00 = x0
+            c10 = torch.stack([x1[..., 0], x0[..., 1]], dim=-1)
+            c01 = torch.stack([x0[..., 0], x1[..., 1]], dim=-1)
+            c11 = x1
+            
+            # Hash corner coordinates to lookup table indices
+            h00 = self.hash(c00)
+            h10 = self.hash(c10)
+            h01 = self.hash(c01)
+            h11 = self.hash(c11)
+            
+            # Lookup features
+            f00 = self.embeddings[i](h00)
+            f10 = self.embeddings[i](h10)
+            f01 = self.embeddings[i](h01)
+            f11 = self.embeddings[i](h11)
+            
+            # Bilinear interpolation
+            # f0 = f00 * (1 - wt_x) + f10 * wt_x
+            # f1 = f01 * (1 - wt_x) + f11 * wt_x
+            # f = f0 * (1 - wt_y) + f1 * wt_y
+            
+            wt_x = wt[..., 0:1]
+            wt_y = wt[..., 1:2]
+            
+            f0 = f00 * (1 - wt_x) + f10 * wt_x
+            f1 = f01 * (1 - wt_x) + f11 * wt_x
+            f = f0 * (1 - wt_y) + f1 * wt_y
+            
+            level_features.append(f)
+            
+        # Concatenate features from all levels
+        features = torch.cat(level_features, dim=-1) # [B, H, W, L * F]
+        return features.permute(0, 3, 1, 2) # [B, L*F, H, W]
+
+class LearnableImageHash(LearnableImage):
+    def __init__(self, height, width, channels=3, num_levels=16, table_size=2**14, 
+                 features_per_level=2, min_res=16, max_res=512, hidden_dim=64):
+        super().__init__(height, width, channels)
+        self.uv_grid = nn.Parameter(get_uv_grid(height, width, batch_size=1, mind=0, maxd=1), requires_grad=False)
+        
+        self.encoder = HashEncoding(num_levels, table_size, features_per_level, min_res, max_res)
+        
+        # Tiny MLP
+        input_dim = num_levels * features_per_level
+        self.mlp = nn.Sequential(
+            nn.Conv2d(input_dim, hidden_dim, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(hidden_dim, hidden_dim, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(hidden_dim, channels, kernel_size=1),
+            nn.Sigmoid()
+        )
+
+    def forward(self):
+        features = self.encoder(self.uv_grid)
+        output = self.mlp(features).permute(0, 2, 3, 1)
+        return output

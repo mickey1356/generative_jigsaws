@@ -1,0 +1,82 @@
+[folder]
+out_folder = "experiments"
+name = "base"
+
+
+[general]
+seed = 42
+device = "cuda"
+dim = 512
+
+pieces = 12
+
+
+[optimization]
+# how many iterations to optimize for
+iters = 5000
+# how many warmup steps for the lr (cosine scheduler)
+lr_warmup = 2000
+# learning rate for the slowness map
+lr = 5e-4
+# learning rate for the src points and rotation angle
+lr_src = 1e-4
+lr_angle = 1e-4
+
+
+[weights]
+# weights for the different loss components
+global_img_wt = 20
+indiv_img_wt = 20
+size_wt = 500
+smoothness_wt = 50
+reg_wt = 10
+
+reg_radius = 0.12
+
+
+[prompts]
+# if a prompt is not provided, it will be skipped in the optimization
+# prompts can be either a string or a list of strings
+# if it's a single string, all images will use the same prompt
+# if it's a list of strings, any prompt that is omitted will be skipped
+prompt = "cat"
+# overall prompt is used for the global image
+overall_prompt = "cat"
+
+# additional prompts are appended to the end of the prompt (if not provided, will default to the empty string)
+add_prompt = "trending on artstation. black silhouette on plain white background. high quality. beautiful illustration. masterpiece."
+neg_prompt = "blurry. low-detail. low quality. extra limbs. deformed. disfigured."
+
+
+[models]
+# what diffusion model to use and its cfg scale
+# M/L/XL for deepfloyd
+# SDI for stable diffusion with the SDI loss
+silhouette_model_type = "L"
+silhouette_cfg = 10
+
+# whether to use a cached version of the text embeddings
+# this computes the hash and looks for the matching hash
+use_saved_embeds = true
+
+
+[misc]
+# how the initial source points are placed
+src_sample_mode = "fib_disk" # fibdisk, fib_square, poisson_disk, grid
+# the initial domain of the source points
+piece_domain = 0.7
+
+# how much of the border to use for the slowness map
+bg_border = 15
+bg_position = 0.97
+
+# range of the slowness map
+smax = 5.1
+smin = 0.1
+
+# how hard the softmin will be
+# and also how long the warmup should be
+# the softness is scheduled using a sigmoid scheduler
+min_render_beta = 10
+max_render_beta = 100
+beta_warmup_steps = 2000
