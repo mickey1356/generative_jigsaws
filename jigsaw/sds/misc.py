@@ -21,7 +21,7 @@ def get_text_embeds(prompt, model_id, proc_class, device="cuda", use_saved=True,
         prompt_processor.destroy_text_encoder()
         return text_embeddings
 
-def get_guidance_and_text_embeds(model_type, prompts, guidance_scale=50, device="cuda", use_saved=True, save_path="text_embeds", neg_prompt=""):
+def get_guidance_and_text_embeds(model_type, prompts, oprompt, guidance_scale=50, device="cuda", use_saved=True, save_path="text_embeds", neg_prompt=""):
     if model_type in ["M", "L", "XL"]:
         model_id = f"DeepFloyd/IF-I-{model_type}-v1.0"
         guidance = DeepFloydGuidance(model_id=model_id, guidance_scale=guidance_scale, device=device)
@@ -33,17 +33,21 @@ def get_guidance_and_text_embeds(model_type, prompts, guidance_scale=50, device=
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
+    text_embeddings = []
     if isinstance(prompts, str):
-        text_embeddings = get_text_embeds(prompts, model_id, prompt_proc, device, use_saved=use_saved, save_path=save_path, neg_prompt=neg_prompt)
-        return guidance, text_embeddings
+        text_embeddings.append(get_text_embeds(prompts, model_id, prompt_proc, device, use_saved=use_saved, save_path=save_path, neg_prompt=neg_prompt))
     elif isinstance(prompts, list):
-        text_embeddings = []
         for prompt in prompts:
-            text_embeddings.append(get_text_embeds(prompt, model_id, prompt_proc, device, use_saved=use_saved, save_path=save_path, neg_prompt=neg_prompt))
-        return guidance, torch.stack(text_embeddings, dim=0)
+            if prompt is not None:
+                text_embeddings.append(get_text_embeds(prompt, model_id, prompt_proc, device, use_saved=use_saved, save_path=save_path, neg_prompt=neg_prompt))
     else:
         raise TypeError("Prompts must be either a string or a list of strings.")
+    
+    overall_embeddings = None
+    if oprompt is not None:
+        overall_embeddings = get_text_embeds(oprompt, model_id, prompt_proc, device, use_saved=use_saved, save_path=save_path, neg_prompt=neg_prompt)
 
+    return guidance, torch.stack(text_embeddings, dim=0), overall_embeddings
 
 
 def C(value, epoch: int, global_step: int, interpolation="linear") -> float:

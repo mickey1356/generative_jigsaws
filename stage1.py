@@ -180,8 +180,8 @@ def pipeline(config: tomlkit.TOMLDocument):
     use_saved_embeds = config["models"].get("use_saved_embeds", True)
 
     # deal with the prompts
-    raw_prompt = config["prompts"].get("prompt", None)
-    raw_overall_prompt = config["prompts"].get("overall_prompt", None)
+    raw_prompt = config["prompts"].get("prompt", "")
+    raw_overall_prompt = config["prompts"].get("overall_prompt", "")
     add_prompt = f'{config["prompts"].get("add_prompt", "")}'
     neg_prompt = f'{config["prompts"].get("neg_prompt", "")}'
 
@@ -190,18 +190,20 @@ def pipeline(config: tomlkit.TOMLDocument):
     #     print("Error: No prompt provided in config!")
     #     return
     if isinstance(raw_prompt, str):
-        prompts = [f"{raw_prompt}. {add_prompt}"] * pieces
+        if raw_prompt != "":
+            prompts = [f"{raw_prompt}. {add_prompt}"] * pieces
+        else:
+            prompts = [None] * pieces
+        raw_prompt = [raw_prompt]
     elif isinstance(raw_prompt, list):
-        none_prompts = pieces - len(raw_prompt)
-        # if len(prompt) != pieces:
-            # print("Error: Length of prompt list must match number of pieces!")
-            # return
-        prompts = [f"{p}. {add_prompt}" for p in raw_prompt] + [None] * none_prompts
+        prompts = [f"{p}. {add_prompt}" for p in raw_prompt if p]
+        none_prompts = pieces - len(prompts)
+        prompts += [None] * none_prompts
     else:
         print("Error: Prompt must be either a string or a list of strings!")
         return
 
-    if raw_overall_prompt is not None:
+    if raw_overall_prompt != "":
         oprompts = f"{raw_overall_prompt}. {add_prompt}"
     else:
         oprompts = None
@@ -218,11 +220,11 @@ def pipeline(config: tomlkit.TOMLDocument):
 
 
     # get sds stuff
-    guidance, text_embeddings = get_guidance_and_text_embeds(model_type, prompts + [oprompts], guidance_scale=cfg, device=device, use_saved=use_saved_embeds, save_path="text_embeds", neg_prompt=neg_prompt)
+    guidance, piece_embeddings, overall_embeddings = get_guidance_and_text_embeds(model_type, prompts, oprompts, guidance_scale=cfg, device=device, use_saved=use_saved_embeds, save_path="text_embeds", neg_prompt=neg_prompt)
 
-    # split the embeddings into piece-wise and overall
-    piece_embeddings = text_embeddings[:-1] # (pieces, 2, D, E)
-    overall_embeddings = text_embeddings[-1] # (2, D, E)
+    # piece_embeddings should have size (non-none pieces, 2, D, E)
+    # overall_embeddings should have size (2, D, E)
+    assert piece_embeddings.shape[0] == len(prompted_indices), "Error, number of prompted pieces and text embeds don't match"
 
     # generate PIECES src positions in [-1, 1]^2
     if src_sample_mode == "fib_disk":
@@ -275,7 +277,7 @@ def pipeline(config: tomlkit.TOMLDocument):
     print("====================================================")
     print("Starting:", os.path.join(out_folder, save_folder))
     print("Overall prompt:", raw_overall_prompt)
-    print("Piecewise prompts:", raw_prompt)
+    print("Piecewise prompts:", [p for p in raw_prompt if p])
     print("Additional prompts:", add_prompt)
     print("Negative prompts:", neg_prompt)
     print("====================================================")
@@ -317,7 +319,7 @@ def pipeline(config: tomlkit.TOMLDocument):
         img_rgb = img_bw.unsqueeze(2).repeat(1, 1, 3).unsqueeze(0) # 1 x DIM x DIM x 3
         img_rgb = torch.clamp(img_rgb, 0, 1)
 
-        if oprompts is not None:
+        if overall_embeddings is not None:
             global_img_loss = guidance(img_rgb, overall_embeddings)["loss_sds"]
             backprop_losses.append((global_img_wt, global_img_loss))
 
@@ -424,7 +426,9 @@ def pipeline(config: tomlkit.TOMLDocument):
                     plot_img(ax[f"piece_{i}_rot"], img_indiv_rgb_rot[i].detach().cpu().numpy(), f"Soft foreground {i} (rotated) (it={it})")
                     plot_img(ax[f"piece_{i}"], img_indiv_rgb[i].detach().cpu().numpy(), f"Soft foreground {i} (it={it})")
                     plot_img(ax[f"piece_{i}_hard"], hard_T != i, f"Hard foreground {i} (it={it})", cmap="gray")
-                    ax[f"piece_{i}_prompt"].text(0.5, 0.5, textwrap.fill(prompts[i], width=30), fontsize=12, ha="center", va="center", wrap=True)
+
+                    text_lbl = prompts[i] if prompts[i] is not None else ""
+                    ax[f"piece_{i}_prompt"].text(0.5, 0.5, textwrap.fill(text_lbl, width=30), fontsize=12, ha="center", va="center", wrap=True)
 
                 fig.colorbar(ax["slowness"].images[0], ax=ax["slowness"], fraction=0.046, pad=0.04)
                 plt.tight_layout()
