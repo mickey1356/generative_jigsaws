@@ -3,6 +3,8 @@ from PIL import Image
 import meshio
 import matplotlib.pyplot as plt
 from mpl_toolkits.axes_grid1 import make_axes_locatable
+from pathlib import Path
+
 
 def save_mesh(fname, verts, faces, face_type="triangle"):
     mesh = meshio.Mesh(
@@ -92,3 +94,24 @@ class FigureGrid:
         if i >= len(self.axs):
             raise IndexError("FigureGrid index out of range")
         return self.axs[i]
+
+    def imshow(self, *imgs, **kwargs):
+        for img in imgs:
+            ax = self.next()
+            if img.ndim == 2 or img.shape[2] == 1:
+                ax.imshow(img, cmap="gray", **kwargs)
+            else:
+                ax.imshow(img, **kwargs)
+            ax.axis("on")
+            ax.set_xticks([])
+            ax.set_yticks([])
+
+
+def unique_name(directory, name):
+    p = Path(directory) / name
+    counter = 1
+    while p.exists():
+        name = f"{name}{counter}"
+        p = Path(directory) / name
+        counter += 1
+    return name

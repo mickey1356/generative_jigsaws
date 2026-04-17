@@ -6,18 +6,18 @@ import tomlkit
 import random
 import pickle
 import textwrap
+import argparse
+from pathlib import Path
 
 import torch
-import torchvision
-import torchvision.transforms.functional as tvf
-from torchmetrics.multimodal import CLIPScore
 import kornia as K
 
 import jigsaw.fsm as fsm
-import jigsaw.misc as misc
-from jigsaw.ffn import LearnableImageFourier
+import jigsaw.samplers as samplers
+from jigsaw.ffn import LearnableImageFourier, LearnableImageFourierNoFixed
 from jigsaw.optim import sigmoid_scheduler, cosine_warmup_lmb
 from jigsaw.sds.misc import get_guidance_and_text_embeds
+from jigsaw.helpers import unique_name
 
 
 def scatter(ax, foreground_src, background_src, fg_color='white', bg_color='black', inv_y=True, bg=True):
@@ -218,7 +218,6 @@ def pipeline(config: tomlkit.TOMLDocument):
     with open(os.path.join(out_folder, save_folder, "prompts.pkl"), "wb") as f:
         pickle.dump(save_prompts, f)
 
-
     # get sds stuff
     guidance, piece_embeddings, overall_embeddings = get_guidance_and_text_embeds(model_type, prompts, oprompts, guidance_scale=cfg, device=device, use_saved=use_saved_embeds, save_path="text_embeds", neg_prompt=neg_prompt)
 
@@ -228,13 +227,13 @@ def pipeline(config: tomlkit.TOMLDocument):
 
     # generate PIECES src positions in [-1, 1]^2
     if src_sample_mode == "fib_disk":
-        foreground_samples = misc.fibonacci_lattice(pieces, "disk")
+        foreground_samples = samplers.fibonacci_lattice(pieces, "disk")
     elif src_sample_mode == "fib_square":
-        foreground_samples = misc.fibonacci_lattice(pieces, "square")
+        foreground_samples = samplers.fibonacci_lattice(pieces, "square")
     elif src_sample_mode == "poisson_disk":
-        foreground_samples = misc.poisson_disk_sampling(pieces, r=0.3, seed=seed)
+        foreground_samples = samplers.poisson_disk_sampling(pieces, r=0.3, seed=seed)
     elif src_sample_mode == "grid":
-        foreground_samples = misc.grid(pieces)
+        foreground_samples = samplers.grid(pieces)
     else:
         raise ValueError(f"Unknown sample method: {src_sample_mode}")
     # scale down to [-PIECE_DOMAIN, PIECE_DOMAIN]^2
@@ -252,6 +251,7 @@ def pipeline(config: tomlkit.TOMLDocument):
 
     # initialize the slowness map
     f = LearnableImageFourier(dim, dim, channels=1).to(device)
+    # f = LearnableImageFourierNoFixed(channels=1).to(device)
 
     # rotation angles
     rotation_angles = torch.from_numpy(np.random.uniform(0, 360, size=pieces)).float().to(device)
@@ -269,17 +269,17 @@ def pipeline(config: tomlkit.TOMLDocument):
         lambda it: cosine_warmup_lmb(it, warmup=lr_warmup_steps, total=int(1.5 * iters)),
     ]
 
-    optim = torch.optim.AdamW(opt_params, lr=lr)
+    optim = torch.optim.AdamW(opt_params)
     scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lr_lambda)
 
     print()
     print()
     print("====================================================")
-    print("Starting:", os.path.join(out_folder, save_folder))
-    print("Overall prompt:", raw_overall_prompt)
-    print("Piecewise prompts:", [p for p in raw_prompt if p])
-    print("Additional prompts:", add_prompt)
-    print("Negative prompts:", neg_prompt)
+    print(f"Starting: {os.path.join(out_folder, save_folder)} - ({pieces} pieces)")
+    print("\tOverall prompt:", raw_overall_prompt)
+    print("\tPiecewise prompts:", [p for p in raw_prompt if p])
+    print("\tAdditional prompts:", add_prompt)
+    print("\tNegative prompts:", neg_prompt)
     print("====================================================")
     print()
 
@@ -292,7 +292,7 @@ def pipeline(config: tomlkit.TOMLDocument):
 
         # "hardness" of silhouette
         render_beta = sigmoid_scheduler(min_render_beta, max_render_beta, it, beta_warmup_steps, iters, k=10)
-        indiv_wt = sigmoid_scheduler(indiv_img_wt, indiv_img_wt * 2, it, 500, iters, k=10)
+        indiv_wt = sigmoid_scheduler(indiv_img_wt, indiv_img_wt * 1.5, it, 500, iters, k=10)
 
         optim.zero_grad()
 
@@ -314,14 +314,14 @@ def pipeline(config: tomlkit.TOMLDocument):
         # apply softmax with render_beta [pieces + srcs, DIM, DIM] 
         soft_T = fsm.soft_voronoi(T, beta=render_beta)
 
-        # combined image
+        # overall image
         img_bw = 1 - fsm.rasterize_T(soft_T, foregrounds) # DIM x DIM
         img_rgb = img_bw.unsqueeze(2).repeat(1, 1, 3).unsqueeze(0) # 1 x DIM x DIM x 3
         img_rgb = torch.clamp(img_rgb, 0, 1)
 
         if overall_embeddings is not None:
-            global_img_loss = guidance(img_rgb, overall_embeddings)["loss_sds"]
-            backprop_losses.append((global_img_wt, global_img_loss))
+            overall_img_loss = guidance(img_rgb, overall_embeddings)["loss_sds"]
+            backprop_losses.append((global_img_wt, overall_img_loss))
 
         # individual images
         img_indiv_bw = 1 - fsm.rasterize_T_index(soft_T, foregrounds) # N x DIM x DIM, black on white
@@ -361,7 +361,7 @@ def pipeline(config: tomlkit.TOMLDocument):
         reg_loss = 0
         yy, xx = torch.meshgrid(torch.linspace(-1, 1, dim, device=device), torch.linspace(-1, 1, dim, device=device), indexing="ij")
         for i in range(pieces):
-            area = indiv_pct[i]
+            area = indiv_pct[i].detach()
             # if the current area is too small, add a regularization directly on the texture map
             # if area < avg_area * (1 - REG_RANGE):
             # minimize the slowness around the piece (weighted using a gaussian distribution)
@@ -372,7 +372,7 @@ def pipeline(config: tomlkit.TOMLDocument):
             # reg_loss += 0.05 * (((SMIN + (SMAX - SMIN) * gaussian) - slowness) ** 2).mean()
             # regularization: directly minimize the slowness weighted by the gaussian
             # add an additional weight that increases as the area gets smaller
-            reg_loss += (slowness * (gaussian > 0.1).float()).mean() / (area + 1e-8)
+            reg_loss += (slowness * gaussian).mean() / (area + 1e-8)
 
         # minimize the slowness in general
         reg_loss += 0.1 * torch.mean(slowness)
@@ -438,7 +438,7 @@ def pipeline(config: tomlkit.TOMLDocument):
 
                 if it == 0:
                     fig.savefig(os.path.join(out_folder, save_folder, "init.png"))
-                else:
+                elif it < iters - 1:
                     fig.savefig(os.path.join(out_folder, save_folder, f"iters/{it}.png"))
                 plt.close(fig)
 
@@ -483,22 +483,57 @@ def pipeline(config: tomlkit.TOMLDocument):
 
 
 if __name__ == "__main__":
-    base_config = "configs/base.toml"
+    parser = argparse.ArgumentParser(description="Generate jigsaw puzzles from a text prompt.")
+    parser.add_argument("-b", "--base_config", type=str, default="configs/base.toml", help="Path to the base config file (TOML format). This will be used as the default config and updated with the provided config.")
+    parser.add_argument("-c", "--config", type=str, help="Path to the config file (TOML format).")
+    parser.add_argument("--pieces", type=int, help="Number of pieces to generate. This will override the pieces provided in the config file (if any).")
+    parser.add_argument("--prompts", type=str, help="Text prompt for both the pieces and the overall image. This will override ALL prompts provided in the config file (if any).")
+    parser.add_argument("--overall_prompt", type=str, help="Text prompt for the overall image. This will override the overall prompt provided in the config file (if any).")
+    parser.add_argument("--name", type=str, help="Name of the output folder. This will override the name provided in the config file (if any).")
+
+    args = parser.parse_args()
+
+    base_config = args.base_config
+    # base_config = "configs/base.toml"
     with open(base_config, "rb") as f:
         base = tomlkit.load(f)
 
-    configfile = "configs/base.toml" if len(sys.argv) == 1 else sys.argv[1]
+    configfile = args.config if args.config else None
 
-    print("Loading config from", configfile)
-    with open(configfile, "rb") as f:
-        config = tomlkit.load(f)
+    if configfile is not None:
+        print("Loading config from", configfile)
+        with open(configfile, "rb") as f:
+            config = tomlkit.load(f)
 
-    # update the base config with the new config
-    for section in config:
-        if section not in base:
-            base[section] = config[section]
-        else:
-            for key in config[section]:
-                base[section][key] = config[section][key]
-    
+        # update the base config with the new config
+        for section in config:
+            if section not in base:
+                base[section] = config[section]
+            else:
+                for key in config[section]:
+                    base[section][key] = config[section][key]
+
+    # override prompt if provided
+    if args.prompts is not None:
+        base["prompts"]["prompt"] = args.prompts
+        base["prompts"]["overall_prompt"] = args.prompts
+
+        # override the name of the output folder
+        tname = args.prompts.replace(" ", "_")[:50]
+        # make it unique
+        tname = unique_name(base["folder"]["out_folder"], tname)
+        base["folder"]["name"] = tname
+
+    # override overall prompt if provided
+    if args.overall_prompt is not None:
+        base["prompts"]["overall_prompt"] = args.overall_prompt
+
+    # override name if provided
+    if args.name is not None:
+        base["folder"]["name"] = args.name
+
+    # override pieces if provided
+    if args.pieces is not None:
+        base["general"]["pieces"] = args.pieces
+
     pipeline(base)

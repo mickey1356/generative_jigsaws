@@ -1,5 +1,6 @@
 import numpy as np
 import tqdm
+from collections import defaultdict
 
 
 def extract_edges(grid, disable=False):
@@ -213,3 +214,199 @@ def simplify_polygons_topological(vertices, Fs, epsilon):
         final_Fs.append(f_indices)
         
     return np.array(new_vertices, dtype=np.float32), final_Fs
+
+def get_edges(Vind):
+    # get edges, i.e. returns a list of pairs of vertex indices that form edges
+    edges = [(Vind[i], Vind[(i + 1) % len(Vind)]) for i in range(len(Vind))]
+    return np.array(edges, dtype=int)
+
+def subdivide_polygons_edges(V, Fs, full_piece, esize=None):
+    # first compute min length of edges over all polygons
+    if esize is None:
+        for F in Fs:
+            edges = get_edges(F)
+            edge_vecs = V[edges[:, 0]] - V[edges[:, 1]]
+            edge_lengths = np.linalg.norm(edge_vecs, axis=1)
+            esize = min(esize, edge_lengths.min()) if esize is not None else edge_lengths.min()
+    
+    edge_to_faces = defaultdict(list)
+
+    for fi, F in enumerate(Fs):
+        edges = get_edges(F)
+        for e in edges:
+            edge_to_faces[tuple(sorted(e))].append(fi)
+    
+    new_V = V.tolist()
+    edges_splits = {} # (i, j) -> [i ... j] with the subdivided vertices in between
+
+    # edge splits
+    for (i, j) in edge_to_faces.keys():
+        vi, vj = V[i], V[j]
+        length = np.linalg.norm(vi - vj)
+
+        if length <= esize:
+            edges_splits[(i, j)] = [i, j]
+            continue
+
+        k = int(np.ceil(length / esize))
+        indices = [i]
+        for t in np.linspace(0, 1, k + 1)[1:-1]:
+            new_pt = (1 - t) * vi + t * vj
+            new_V.append(new_pt)
+            indices.append(len(new_V) - 1)
+        indices.append(j)
+
+        edges_splits[(i, j)] = indices
+
+    # rebuild faces
+    new_Fs = []
+    for F in Fs:
+        edges = get_edges(F)
+        new_F = []
+        for e in edges:
+            key = tuple(sorted(e))
+            split_edge = edges_splits[key]
+
+            # check if edge was flipped
+            if split_edge[0] == e[0]:
+                new_F.extend(split_edge[:-1])
+            else:
+                new_F.extend(split_edge[:0:-1])
+        new_Fs.append(new_F)
+
+    # rebuild full piece
+    full_edges = get_edges(full_piece)
+    new_full_piece = []
+    for e in full_edges:
+        key = tuple(sorted(e))
+        split_edge = edges_splits[key]
+
+        if split_edge[0] == e[0]:
+            new_full_piece.extend(split_edge[:-1])
+        else:
+            new_full_piece.extend(split_edge[:0:-1])
+    
+    return np.array(new_V), new_Fs, new_full_piece
+
+def subdivide_polygons_edges_count(V, Fs, full_piece, target=80):
+    def find_edge(F, i, j, k):
+        nF = []
+        # find the edge (i, j) or (j, i) in F and insert k in between, returning the new F
+        for idx in range(len(F)):
+            u, v = F[idx], F[(idx + 1) % len(F)]
+            if (u == i and v == j) or (u == j and v == i):
+                nF.append(u)
+                nF.append(k)
+            else:
+                nF.append(u)
+        return nF
+
+    edge_to_faces = defaultdict(list)
+
+    for fi, F in enumerate(Fs):
+        edges = get_edges(F)
+        for e in edges:
+            edge_to_faces[tuple(sorted(e))].append(fi)
+    
+    new_V = V.tolist()
+    nV_np = np.array(new_V)
+    edges_splits = {} # (i, j) -> [i ... j] with the subdivided vertices in between
+
+    vertex_cnt = [len(F) for F in Fs]
+
+    nFs = [F[:] for F in Fs]
+    n_full_piece = full_piece[:]
+
+    while min(vertex_cnt) < target:
+        # figure out which piece has the least vertices
+        piece_idx = np.argmin(vertex_cnt)
+        # find the longest edge in that piece
+        edges = get_edges(nFs[piece_idx])
+        edge_vecs = nV_np[edges[:, 0]] - nV_np[edges[:, 1]]
+        edge_lengths = np.linalg.norm(edge_vecs, axis=1)
+        longest_edge_idx = np.argmax(edge_lengths)
+        i, j = edges[longest_edge_idx]
+        # subdivide the edge
+        vnew = (nV_np[i] + nV_np[j]) / 2
+        # add new vertex and update numpy array
+        new_V.append(vnew)
+        nV_np = np.array(new_V)
+        # update polygons
+        for fi in edge_to_faces[tuple(sorted((i, j)))]:
+            nFs[fi] = find_edge(nFs[fi], i, j, len(new_V) - 1)
+            vertex_cnt[fi] += 1
+        # update full piece
+        n_full_piece = find_edge(n_full_piece, i, j, len(new_V) - 1)
+        # update edge_to_faces
+        edge_to_faces[tuple(sorted((i, len(new_V) - 1)))].extend(edge_to_faces[tuple(sorted((i, j)))])
+        edge_to_faces[tuple(sorted((j, len(new_V) - 1)))].extend(edge_to_faces[tuple(sorted((i, j)))])
+        edge_to_faces[tuple(sorted((i, j)))].clear()
+
+    return nV_np, nFs, n_full_piece
+    
+
+def convert_to_bezier(V, Fs, overall_piece, alpha_scale=0.3):
+    adj = defaultdict(set)
+    edge_to_faces = defaultdict(list)
+
+    # build adjacency and edge-to-face mapping
+    for fi, F in enumerate(Fs):
+        edges = get_edges(F)
+        for e in edges:
+            edge_to_faces[tuple(sorted(e))].append(fi)
+            adj[e[0]].add(e[1])
+            adj[e[1]].add(e[0])
+    
+    # compute per-vertex tangents
+    T = np.zeros_like(V)
+    for i in range(len(V)):
+        vi = V[i]
+        neighbors = adj[i]
+
+        for j in neighbors:
+            T[i] += V[j] - vi
+
+    # normalize tangents
+    T_norm = np.linalg.norm(T, axis=1, keepdims=True) + 1e-8
+    T = T / T_norm
+
+    # create bezier edges
+    new_V = V.tolist()
+    edges_bezier = {} # (i, j) -> [i c1 c2 j] with the control points in between
+
+    for (i, j) in edge_to_faces.keys():
+        vi = V[i]
+        vj = V[j]
+        ti = T[i]
+        tj = T[j]
+
+        edge_vec = vj - vi
+        edge_len = np.linalg.norm(edge_vec)
+
+        alpha = alpha_scale * edge_len
+        c1 = vi + (vj - vi) / 3
+        c2 = vj - (vj - vi) / 3
+
+        new_V.extend([c1, c2])
+        edges_bezier[(i, j)] = [i, len(new_V) - 2, len(new_V) - 1, j]
+        edges_bezier[(j, i)] = [j, len(new_V) - 1, len(new_V) - 2, i]
+
+    # rebuild faces with control points
+    new_Fs = []
+    for F in Fs:
+        edges = get_edges(F)
+        new_F = []
+        for e in edges:
+            key = tuple(e)
+            new_F.extend(edges_bezier[key][:-1])
+        new_Fs.append(new_F)
+    
+    # rebuild overall piece
+    full_edges = get_edges(overall_piece)
+    new_full_piece = []
+    for e in full_edges:
+        key = tuple(e)
+        new_full_piece.extend(edges_bezier[key][:-1])
+
+
+    return V, np.array(new_V), new_Fs, new_full_piece

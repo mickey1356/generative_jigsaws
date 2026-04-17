@@ -101,3 +101,4 @@ def grid(n):
     points = np.column_stack((xv.ravel(), yv.ravel()))
     
     return points[:n]
+
