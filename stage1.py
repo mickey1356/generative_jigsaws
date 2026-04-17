@@ -14,7 +14,7 @@ import kornia as K
 
 import jigsaw.fsm as fsm
 import jigsaw.samplers as samplers
-from jigsaw.ffn import LearnableImageFourier, LearnableImageFourierNoFixed
+from jigsaw.ffn import LearnableImageFourier, LearnableImageFourierNoFixed, get_uv_grid
 from jigsaw.optim import sigmoid_scheduler, cosine_warmup_lmb
 from jigsaw.sds.misc import get_guidance_and_text_embeds
 from jigsaw.helpers import unique_name
@@ -29,6 +29,33 @@ def scatter(ax, foreground_src, background_src, fg_color='white', bg_color='blac
     ax.scatter(fg_np[:, 0], fg_np[:, 1], marker='x', color=fg_color, s=8)
     if bg:
         ax.scatter(bg_np[:, 0], bg_np[:, 1], marker='x', color=bg_color, s=8)
+
+def plot_img(ax, img, title, **kwargs):
+    ax.axis("on")
+    ax.imshow(img, extent=(-1, 1, -1, 1), **kwargs)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.set_aspect("equal")
+    ax.set_title(title, fontsize=6)
+
+
+def plot_img_with_scatter(ax, img, title, fg_src=None, bg_src=None, fg_col="white", bg_col="black", inv_y=True, bg=True, **kwargs):
+    plot_img(ax, img, title, **kwargs)
+    scatter(ax, fg_src, bg_src, fg_col, bg_col, inv_y=inv_y, bg=bg)
+
+
+def plot_losses(ax, losses):
+    # losses is a list of dicts, where losses[it] = {key: value}
+    loss_names = [key for key in losses[0].keys()]
+    for loss_name in loss_names:
+        ax.plot([loss[loss_name] for loss in losses], label=loss_name)
+    ax.axis("on")
+    ax.set_xlabel("Iteration", fontsize=6)
+    ax.set_ylabel("Loss", fontsize=6)
+    ax.set_title("Losses Over Time", fontsize=6)
+    ax.tick_params(axis="both", which="major", labelsize=6)
+    ax.tick_params(axis="both", which="minor", labelsize=5)
+    ax.legend(loc="upper left", fontsize=6)
 
 
 def get_bbox_centers(silhouettes, threshold=0.5):
@@ -96,42 +123,20 @@ def extract_pieces(silhouettes, threshold=0.8, padding=20, dim=256):
     return torch.stack(pieces, dim=0)
 
 
-def plot_img(ax, img, title, **kwargs):
-    ax.axis("on")
-    ax.imshow(img, extent=(-1, 1, -1, 1), **kwargs)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.set_aspect("equal")
-    ax.set_title(title, fontsize=6)
-
-def plot_img_with_scatter(ax, img, title, fg_src=None, bg_src=None, fg_col="white", bg_col="black", inv_y=True, bg=True, **kwargs):
-    plot_img(ax, img, title, **kwargs)
-    scatter(ax, fg_src, bg_src, fg_col, bg_col, inv_y=inv_y, bg=bg)
-
-def plot_losses(ax, losses):
-    # losses is a list of dicts, where losses[it] = {key: value}
-    loss_names = [key for key in losses[0].keys()]
-    for loss_name in loss_names:
-        ax.plot([loss[loss_name] for loss in losses], label=loss_name)
-    ax.axis("on")
-    ax.set_xlabel("Iteration", fontsize=6)
-    ax.set_ylabel("Loss", fontsize=6)
-    ax.set_title("Losses Over Time", fontsize=6)
-    ax.tick_params(axis="both", which="major", labelsize=6)
-    ax.tick_params(axis="both", which="minor", labelsize=5)
-    ax.legend(loc="upper left", fontsize=6)
-
-
 def pipeline(config: tomlkit.TOMLDocument):
     seed = config["general"].get("seed", -1)
-    if seed >= 0:
-        random.seed(seed)
-        torch.manual_seed(seed)
-        np.random.seed(seed)
+    if seed < 0:
+        seed = random.randint(0, 1000000)
+        config["general"]["seed"] = seed
+    random.seed(seed)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
 
     device = config["general"].get("device", "cuda")
 
     dim = config["general"].get("dim", 512)
+    bg_border = config["misc"].get("bg_border", 8)
+
     pieces = config["general"].get("pieces", -1)
     if pieces < 1:
         print("Error: pieces must be specified and greater than 0!")
@@ -141,8 +146,7 @@ def pipeline(config: tomlkit.TOMLDocument):
     src_sample_mode = config["misc"].get("src_sample_mode", "fib_disk")
     piece_domain = config["misc"].get("piece_domain", 0.7)
 
-    bg_border = config["misc"].get("bg_border", 5)
-    bg_position = config["misc"].get("bg_position", 0.95)
+    bg_position = config["misc"].get("bg_position", 0.97)
     smax = config["misc"].get("smax", 7.1)
     smin = config["misc"].get("smin", 0.1)
 
@@ -155,6 +159,13 @@ def pipeline(config: tomlkit.TOMLDocument):
     lr = config["optimization"].get("lr", 5e-4)
     lr_src = config["optimization"].get("lr_src", 1e-4)
     lr_angle = config["optimization"].get("lr_angle", 1e-4)
+
+    # get the schedule for the image dimensions and border
+    # img_schedule = config["optimization"].get("img_schedule", None)
+    # if img_schedule is None:
+    #     img_schedule = [[0, dim, bg_border]]
+    # else:
+    #     img_schedule = sorted(img_schedule, key=lambda x: x[0])
 
     # weights for loss terms
     global_img_wt = config["weights"].get("global_img_wt", 10)
@@ -185,10 +196,6 @@ def pipeline(config: tomlkit.TOMLDocument):
     add_prompt = f'{config["prompts"].get("add_prompt", "")}'
     neg_prompt = f'{config["prompts"].get("neg_prompt", "")}'
 
-
-    # if prompt is None:
-    #     print("Error: No prompt provided in config!")
-    #     return
     if isinstance(raw_prompt, str):
         if raw_prompt != "":
             prompts = [f"{raw_prompt}. {add_prompt}"] * pieces
@@ -250,8 +257,8 @@ def pipeline(config: tomlkit.TOMLDocument):
     foregrounds = list(range(pieces))
 
     # initialize the slowness map
-    f = LearnableImageFourier(dim, dim, channels=1).to(device)
-    # f = LearnableImageFourierNoFixed(channels=1).to(device)
+    # f = LearnableImageFourier(dim, dim, channels=1).to(device)
+    f = LearnableImageFourierNoFixed(channels=1).to(device)
 
     # rotation angles
     rotation_angles = torch.from_numpy(np.random.uniform(0, 360, size=pieces)).float().to(device)
@@ -283,8 +290,9 @@ def pipeline(config: tomlkit.TOMLDocument):
     print("====================================================")
     print()
 
-    losses = []
+    uv_grid = get_uv_grid(dim, dim).to(device)
 
+    losses = []
     # main loop
     for it in tqdm.trange(iters):
         # keep track of losses to be backpropped
@@ -300,7 +308,7 @@ def pipeline(config: tomlkit.TOMLDocument):
         srcs = torch.cat([foregrounds_tensor, backgrounds_tensor], dim=0)
 
         # get the slowness map
-        f_tex = f().squeeze()
+        f_tex = f(uv_grid).squeeze()
         slowness = (smax - smin) * f_tex + smin
         # set the border to be low slowness
         slowness[:bg_border, :] = smin
@@ -460,7 +468,7 @@ def pipeline(config: tomlkit.TOMLDocument):
     # extract the final textures and silhouettes
     with torch.inference_mode():
         # get the slowness map
-        f_tex = f().squeeze()
+        f_tex = f(uv_grid).squeeze()
         slowness = (smax - smin) * f_tex + smin
 
         # set the border to be low slowness
@@ -481,11 +489,15 @@ def pipeline(config: tomlkit.TOMLDocument):
         # also save the rotation angles
         np.save(os.path.join(out_folder, save_folder, f"rotation_angles.npy"), rotation_angles.detach().cpu().numpy())
 
+        # save the model
+        torch.save(f.state_dict(), os.path.join(out_folder, save_folder, "model_weights.pth"))
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate jigsaw puzzles from a text prompt.")
     parser.add_argument("-b", "--base_config", type=str, default="configs/base.toml", help="Path to the base config file (TOML format). This will be used as the default config and updated with the provided config.")
     parser.add_argument("-c", "--config", type=str, help="Path to the config file (TOML format).")
+    parser.add_argument("--seed", type=int, help="Random seed for reproducibility. This will override the seed provided in the config file (if any).")
     parser.add_argument("--pieces", type=int, help="Number of pieces to generate. This will override the pieces provided in the config file (if any).")
     parser.add_argument("--prompts", type=str, help="Text prompt for both the pieces and the overall image. This will override ALL prompts provided in the config file (if any).")
     parser.add_argument("--overall_prompt", type=str, help="Text prompt for the overall image. This will override the overall prompt provided in the config file (if any).")
@@ -535,5 +547,9 @@ if __name__ == "__main__":
     # override pieces if provided
     if args.pieces is not None:
         base["general"]["pieces"] = args.pieces
+    
+    # override seed if provided
+    if args.seed is not None:
+        base["general"]["seed"] = args.seed
 
     pipeline(base)
