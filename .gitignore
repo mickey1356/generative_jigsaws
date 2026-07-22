@@ -4,6 +4,7 @@ _res/
 test_images/
 text_embeds/
 notebooks/
+figures/
 
 .cache/
 .vscode/
@@ -17,3 +18,6 @@ test_post.py
 
 configs/*
 !configs/base.toml
+
+# API key
+CLAUDE_KEY

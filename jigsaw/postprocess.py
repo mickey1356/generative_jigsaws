@@ -15,7 +15,7 @@ def extract_edges(grid, disable=False):
         piece_edges[piece].setdefault(p1, set()).add(p2)
         piece_edges[piece].setdefault(p2, set()).add(p1)
 
-    for y in tqdm.trange(H, disable=disable):
+    for y in range(H):
         for x in range(W):
             piece = grid[y, x]
             # check neighbors
@@ -214,6 +214,48 @@ def simplify_polygons_topological(vertices, Fs, epsilon):
         final_Fs.append(f_indices)
         
     return np.array(new_vertices, dtype=np.float32), final_Fs
+
+def convert_polygons_to_paths(Fs):
+    # first we need to find the intersections
+    # build global edge graph to find junctions
+    adj = defaultdict(set)
+    for F in Fs:
+        for i in range(len(F)):
+            u, v = F[i], F[(i+1) % len(F)]
+            adj[u].add(v)
+            adj[v].add(u)
+    
+    # junctions are vertices where boundaries split/merge (degree != 2)
+    junctions = {v for v, neighbors in adj.items() if len(neighbors) != 2}
+
+    # extract paths by traversing from junction to junction
+    visited_edges = set()
+    paths = []
+    for v in junctions:
+        for neighbor in adj[v]:
+            edge = tuple(sorted((v, neighbor)))
+            if edge in visited_edges:
+                continue
+            
+            path = [v]
+            current = neighbor
+            prev = v
+            
+            while True:
+                path.append(current)
+                visited_edges.add(tuple(sorted((prev, current))))
+                
+                if current in junctions and current != v:
+                    break
+                
+                # move to the next vertex
+                next_vertices = adj[current] - {prev}
+                if not next_vertices:
+                    break
+                prev, current = current, next_vertices.pop()
+            
+            paths.append(path)
+    return paths
 
 def get_edges(Vind):
     # get edges, i.e. returns a list of pairs of vertex indices that form edges

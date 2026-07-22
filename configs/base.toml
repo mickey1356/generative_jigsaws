@@ -80,35 +80,3 @@ smin = 0.1
 min_render_beta = 10
 max_render_beta = 100
 beta_warmup_steps = 2000
-
-
-[postprocess]
-smoothing_kernel = 2
-smoothing_iters = 1000
-smoothing_lr = 2e-3
-simplify_eps = 5e-3
-min_vertices = 60
-
-vertex_lr = 5e-4
-angle_lr = 1e-4
-
-refine_warmup = 50
-refine_iters = 500
-
-optim_smoothing_kernel = 3
-
-tonal_kernel = 201
-tonal_sigma = 30
-
-overall_wt = 5
-indiv_wt = 10
-acap_wt = 5
-
-tonal_wt_a = 100
-tonal_wt_b = 300
-tonal_wt_c = 50
-
-smoothness_wt = 1
-area_wt = 0.2
-
-length_wt = 100

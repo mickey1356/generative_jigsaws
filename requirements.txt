@@ -1,0 +1,38 @@
+# Python dependencies for the jigsaw-puzzle pipeline (stage1.py / stage2.py).
+# Versions are those of the tested environment (conda env "puzzle", Python 3.13).
+#
+# NOT installed from here (see README.md "Installation"):
+#   - torch / torchvision  -> install first, from the CUDA-matched index
+#   - cufsm                -> built from ./cufsm_lib  (pip install ./cufsm_lib)
+#   - pydiffvg             -> built from source (diffvg)
+#
+# Install with:  pip install -r requirements.txt
+
+# --- core scientific stack ---
+numpy==2.2.6
+scipy==1.16.2
+matplotlib==3.10.6
+tqdm==4.67.1
+pillow==11.3.0
+imageio==2.37.0
+tomlkit==0.14.0
+omegaconf==2.3.0
+jaxtyping==0.3.3
+typeguard==4.4.4
+
+# --- diffusion / score-distillation (stage 1) ---
+diffusers>=0.27          # tested with 0.37.0.dev0
+transformers>=4.40       # tested with 5.2.0
+accelerate==1.12.0
+safetensors==0.6.2
+sentencepiece==0.2.1     # required by the DeepFloyd IF (T5) text encoder
+huggingface-hub==1.4.1
+kornia==0.8.2
+
+# --- geometry / meshing / export (stage 2) ---
+trimesh==4.12.1
+meshio==5.3.5
+gmsh==4.14.1
+libigl==2.6.1            # imported as `igl`
+triangle==20250106
+nvdiffrast==0.3.3        # needs CUDA toolkit + ninja at first run; EGL/OpenGL libs at runtime

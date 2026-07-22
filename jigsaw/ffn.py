@@ -6,14 +6,14 @@ import torch.nn as nn
 # Adapted from Diffusion Illusions (Burgert et al. 2024)
 # https://github.com/RyannDaGreat/Diffusion-Illusions/blob/71646f3203e31f126cf2d7998d2507ee326b7c54/source/learnable_textures.py
 
-def get_uv_grid(height, width, batch_size=1, mind=0, maxd=1):
+def get_uv_grid(height, width, batch_size=1, mind=0, maxd=1, device="cpu"):
     y_c = np.linspace(mind, maxd, height, endpoint=False)
     x_c = np.linspace(mind, maxd, width, endpoint=False)
 
     uv = np.stack(np.meshgrid(y_c, x_c), axis=-1)
     uv_grid = torch.from_numpy(uv).unsqueeze(0).permute(0, 3, 1, 2).float().contiguous()
     uv_grid = uv_grid.repeat(batch_size, 1, 1, 1)
-    return uv_grid
+    return uv_grid.to(device)
 
 class GaussianFourierFeatureTransform(nn.Module):
     def __init__(self, channels, num_features=256, scale=10):

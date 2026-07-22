@@ -358,7 +358,7 @@ def pipeline(config: tomlkit.TOMLDocument):
         # img_indiv_rgb_rot = 1 - K.geometry.transform.rotate((1 - img_indiv_rgb.permute(0, 3, 1, 2)), angle=rotation_angles, center=centers).permute(0, 2, 3, 1)
 
         # extract piece into squares and rotate
-        extracted_pieces = extract_pieces(img_indiv_bw, padding=50).unsqueeze(3).repeat(1, 1, 1, 3)
+        extracted_pieces = extract_pieces(img_indiv_bw, padding=50, dim=dim).unsqueeze(3).repeat(1, 1, 1, 3)
         img_indiv_rgb_rot = 1 - K.geometry.transform.rotate((1 - extracted_pieces.permute(0, 3, 1, 2)), angle=rotation_angles).permute(0, 2, 3, 1)
         
         img_indiv_rgb_rot = torch.clamp(img_indiv_rgb_rot, 0, 1)

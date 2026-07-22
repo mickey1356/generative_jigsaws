@@ -74,6 +74,9 @@ class FigureGrid:
         if off:
             [ax.axis('off') for ax in self.axs]
 
+    def tight_layout(self):
+        self.fig.tight_layout()
+
     def save(self, fname):
         self.fig.savefig(fname)
 
