@@ -182,6 +182,10 @@ def pipeline(config: tomlkit.TOMLDocument):
     os.makedirs(os.path.join(out_folder, save_folder), exist_ok=True)
     os.makedirs(os.path.join(out_folder, save_folder, "iters"), exist_ok=True)
 
+    save_all = config["folder"].get("save_all", False)
+    if save_all:
+        os.makedirs(os.path.join(out_folder, save_folder, "all"), exist_ok=True)
+
     # copy the config file to the output folder for reference
     with open(os.path.join(out_folder, save_folder, "config.toml"), "w") as f:
         f.write(tomlkit.dumps(config))
@@ -261,7 +265,7 @@ def pipeline(config: tomlkit.TOMLDocument):
     f = LearnableImageFourierNoFixed(channels=1).to(device)
 
     # rotation angles
-    rotation_angles = torch.from_numpy(np.random.uniform(0, 360, size=pieces)).float().to(device)
+    rotation_angles = torch.from_numpy(np.random.uniform(0, 360, size=pieces)).float().to(device).requires_grad_(True)
 
     # create optimizer for silhouette
     opt_params = [
@@ -291,6 +295,19 @@ def pipeline(config: tomlkit.TOMLDocument):
     print()
 
     uv_grid = get_uv_grid(dim, dim).to(device)
+
+    all_locs = []
+    all_slowness = []
+    all_angles = []
+
+    # save iteration 0
+    if save_all:
+        with torch.no_grad():
+            f_tex = f(uv_grid).squeeze()
+            slowness = (smax - smin) * f_tex + smin
+            all_locs.append(foregrounds_tensor.detach().cpu().numpy())
+            all_slowness.append(slowness.detach().cpu().numpy())
+            all_angles.append(rotation_angles.detach().cpu().numpy())
 
     losses = []
     # main loop
@@ -405,6 +422,12 @@ def pipeline(config: tomlkit.TOMLDocument):
         scheduler.step()
 
         with torch.no_grad():
+            # keep track of all the locations, slowness maps, and angles if we want to save everything
+            if save_all:
+                all_locs.append(foregrounds_tensor.detach().cpu().numpy())
+                all_slowness.append(slowness.detach().cpu().numpy())
+                all_angles.append(rotation_angles.detach().cpu().numpy())
+
             foregrounds_tensor.clamp_(-piece_domain, piece_domain)
 
             if it % 100 == 0 or it == iters - 1:
@@ -455,8 +478,15 @@ def pipeline(config: tomlkit.TOMLDocument):
                 for i in range(len(background_src)):
                     hard_T_bg[hard_T == pieces + i] = -1
                 np.save(os.path.join(out_folder, save_folder, f"pieces.npy"), hard_T_bg)
-                # also save the rotation angles
-                np.save(os.path.join(out_folder, save_folder, f"rotation_angles.npy"), rotation_angles.detach().cpu().numpy())
+
+                torch.save(f.state_dict(), os.path.join(out_folder, save_folder, "model_weights.pth"))
+
+                final_vars = {
+                    "locations": srcs.detach().cpu().numpy(),
+                    "rotation_angles": rotation_angles.detach().cpu().numpy()
+                }
+                with open(os.path.join(out_folder, save_folder, "final_vars.pkl"), "wb") as fv_file:
+                    pickle.dump(final_vars, fv_file)
 
 
     print()
@@ -486,11 +516,22 @@ def pipeline(config: tomlkit.TOMLDocument):
             hard_T_bg[hard_T == pieces + i] = -1
         np.save(os.path.join(out_folder, save_folder, f"pieces.npy"), hard_T_bg)
 
-        # also save the rotation angles
-        np.save(os.path.join(out_folder, save_folder, f"rotation_angles.npy"), rotation_angles.detach().cpu().numpy())
+        # also save source locations and angles
+        final_vars = {
+            "locations": srcs.detach().cpu().numpy(),
+            "rotation_angles": rotation_angles.detach().cpu().numpy()
+        }
+        with open(os.path.join(out_folder, save_folder, "final_vars.pkl"), "wb") as fv_file:
+            pickle.dump(final_vars, fv_file)
 
         # save the model
         torch.save(f.state_dict(), os.path.join(out_folder, save_folder, "model_weights.pth"))
+
+        if save_all:
+            np.save(os.path.join(out_folder, save_folder, "all", "slowness.npy"), np.stack(all_slowness))
+            np.save(os.path.join(out_folder, save_folder, "all", "locations.npy"), np.stack(all_locs))
+            np.save(os.path.join(out_folder, save_folder, "all", "angles.npy"), np.stack(all_angles))
+
 
 
 if __name__ == "__main__":
@@ -502,6 +543,7 @@ if __name__ == "__main__":
     parser.add_argument("--prompts", type=str, help="Text prompt for both the pieces and the overall image. This will override ALL prompts provided in the config file (if any).")
     parser.add_argument("--overall_prompt", type=str, help="Text prompt for the overall image. This will override the overall prompt provided in the config file (if any).")
     parser.add_argument("--name", type=str, help="Name of the output folder. This will override the name provided in the config file (if any).")
+    parser.add_argument("--save_all", action="store_true", help="Whether to save all intermediate results (locations, slowness maps, angles) during optimization. This will override the save_all flag in the config file.")
 
     args = parser.parse_args()
 
@@ -551,5 +593,9 @@ if __name__ == "__main__":
     # override seed if provided
     if args.seed is not None:
         base["general"]["seed"] = args.seed
+
+    # override saveall if provided
+    if args.save_all:
+        base["folder"]["save_all"] = True
 
     pipeline(base)
