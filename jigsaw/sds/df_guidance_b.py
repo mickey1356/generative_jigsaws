@@ -30,7 +30,7 @@ class DeepFloydGuidance:
 
         self.pipe = IFPipeline.from_pretrained(
                     model_id,
-                    force_download=True,
+                    force_download=False,
                     text_encoder=None,
                     safety_checker=None,
                     watermarker=None,
